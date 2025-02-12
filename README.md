@@ -1,0 +1,2 @@
+# seminarkurs
+Programme des Seminarkurses
