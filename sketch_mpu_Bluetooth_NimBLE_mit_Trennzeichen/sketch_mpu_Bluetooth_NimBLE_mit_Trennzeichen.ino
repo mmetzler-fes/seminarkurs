@@ -11,6 +11,10 @@ const int sclPort = 5; // GPIO5 für SCL
 NimBLEServer* pServer = nullptr;
 NimBLECharacteristic* pCharacteristic = nullptr;
 bool deviceConnected = false;
+bool oldDeviceConnected = false;
+unsigned long lastDataSent = 0;
+const unsigned long SEND_INTERVAL = 100; // Sendeintervall in Millisekunden
+const unsigned long RETRY_INTERVAL = 1000; // Reconnect-Intervall in Millisekunden
 
 // UUIDs für den BLE-Service und die Charakteristik
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -25,25 +29,7 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
 
     void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
         deviceConnected = false;
-        Serial.println("Client getrennt");
-        pServer->getAdvertising()->start(); // Werbung erneut starten
-    }
-};
-
-// Callback-Klasse für Charakteristik-Ereignisse
-class MyCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
-        std::string receivedValue = pCharacteristic->getValue();
-        Serial.print("Empfangene Daten: ");
-        Serial.println(receivedValue.c_str());
-
-        // Antwort senden (falls gewünscht)
-        pCharacteristic->setValue("Daten empfangen: " + receivedValue);
-        pCharacteristic->notify();
-    }
-
-    void onRead(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
-        Serial.println("Charakteristik wurde gelesen.");
+        Serial.printf("Client getrennt. Grund: %d\n", reason);
     }
 };
 
@@ -52,42 +38,49 @@ void setup() {
     
     // I2C für den MPU6050 initialisieren
     Wire.begin(sdaPort, sclPort);
-    while (!mpu.begin()) {
+    
+    // MPU6050 Setup mit Retry
+    int mpuRetries = 0;
+    while (!mpu.begin() && mpuRetries < 5) {
         Serial.println("Failed to find MPU6050 chip");
         delay(1000);
+        mpuRetries++;
     }
+    
+    if (mpuRetries >= 5) {
+        Serial.println("MPU6050 initialization failed!");
+        ESP.restart(); // Neustart wenn MPU nicht gefunden
+    }
+    
     Serial.println("MPU6050 Found!");
 
+    // BLE Setup
+    initBLE();
+}
+
+void initBLE() {
     // BLE-Gerät initialisieren
     NimBLEDevice::init("ESP32-C3-NimBLE");
-
+    
+    // Erhöhe die Sendeleistung für bessere Reichweite
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    
     // BLE-Server erstellen
     pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
-    // Warte einen Moment, damit die Initialisierung abgeschlossen wird
-    delay(1000);
-    // Hole die MAC-Adresse und gebe sie aus
-    Serial.println("ESP32-C3 BLE MAC-Adresse:");
-    Serial.println(NimBLEDevice::getAddress().toString().c_str());
-
+    
     // Service erstellen
     NimBLEService* pService = pServer->createService(SERVICE_UUID);
-
-    // Charakteristik hinzufügen mit verschlüsselten Lese-/Schreibrechten
+    
+    // Charakteristik mit angepassten Eigenschaften
     pCharacteristic = pService->createCharacteristic(
         CHARACTERISTIC_UUID,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY |
-        NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::WRITE_ENC // Verschlüsselung erforderlich
+        NIMBLE_PROPERTY::READ | 
+        NIMBLE_PROPERTY::WRITE | 
+        NIMBLE_PROPERTY::NOTIFY
     );
-
-    // Formatierung der Charakteristik mit NimBLE2904
-    NimBLE2904* pDesc = (NimBLE2904*) pCharacteristic->create2904();
-    pDesc->setFormat(NimBLE2904::FORMAT_UTF8);
-
-    // Callbacks für die Charakteristik setzen
-    pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
-
-    // Initialen Wert für die Charakteristik setzen
+    
+    // Setze initiale Werte
     JsonDocument doc;
     doc["Ax"] = 0;
     doc["Ay"] = 0;
@@ -97,30 +90,67 @@ void setup() {
     doc["Gy"] = 0;
     doc["Gz"] = 0;
     doc["player"] = 1;
+    
     char out[512];
     serializeJson(doc, out);
-    // Füge ein Trennzeichen hinzu
     strcat(out, "\n");
     pCharacteristic->setValue(out);
-
+    
     // Service starten
     pService->start();
-
-    // Werbung starten
+    
+    // Advertising konfigurieren und starten
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setMinInterval(32); // 20ms Intervall
+    pAdvertising->setMaxInterval(64); // 40ms Intervall
     pAdvertising->start();
-
+    
     Serial.println("BLE-Server gestartet");
+    Serial.println(NimBLEDevice::getAddress().toString().c_str());
 }
-int iCount=0;
+
 void loop() {
-    iCount++;
-    if (deviceConnected) {
-        JsonDocument doc;
+    // Behandle Verbindungsstatus
+    if (!deviceConnected && oldDeviceConnected) {
+        delay(500); // Gib dem BLE-Stack Zeit zum Aufräumen
+        pServer->startAdvertising(); // Starte Advertising neu
+        Serial.println("Starte Advertising neu...");
+        oldDeviceConnected = deviceConnected;
+    }
+    
+    // Wenn neu verbunden
+    if (deviceConnected && !oldDeviceConnected) {
+        oldDeviceConnected = deviceConnected;
+        Serial.println("Verbindung hergestellt.");
+    }
+    
+    // Sende Daten nur wenn verbunden und Intervall erreicht
+    if (deviceConnected && (millis() - lastDataSent >= SEND_INTERVAL)) {
+        sendSensorData();
+        lastDataSent = millis();
+    }
+    
+    // Prüfe regelmäßig die Verbindung
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck >= RETRY_INTERVAL) {
+        if (!deviceConnected) {
+            Serial.println("Keine Verbindung - Prüfe BLE-Status...");
+            if (!NimBLEDevice::getAdvertising()->isAdvertising()) {
+                Serial.println("Advertising gestoppt - Neustart...");
+                NimBLEDevice::getAdvertising()->start();
+            }
+        }
+        lastCheck = millis();
+    }
+}
+
+void sendSensorData() {
+    try {
         sensors_event_t a, g, temp;
         mpu.getEvent(&a, &g, &temp);
-
+        
+        JsonDocument doc;
         doc["Ax"] = a.acceleration.x;
         doc["Ay"] = a.acceleration.y;
         doc["Az"] = a.acceleration.z;
@@ -129,20 +159,19 @@ void loop() {
         doc["Gy"] = g.gyro.y;
         doc["Gz"] = g.gyro.z;
         doc["player"] = 1;
+        
         char out[512];
         serializeJson(doc, out);
-        // Füge ein Trennzeichen hinzu
         strcat(out, "\n");
-
-        // Daten über BLE senden
-        pCharacteristic->setValue((uint8_t*)out, strlen(out));
-        pCharacteristic->notify();
-        Serial.println("Daten gesendet: " + String(out));
-    } else {
-        if (iCount >= 10) {
-            Serial.println("Serielle Schnittstelle not connected!");
-            iCount = 0;
+        
+        if (pCharacteristic->notify((uint8_t*)out, strlen(out))) {
+            Serial.print("Daten gesendet: ");
+            Serial.println(out);
+        } else {
+            Serial.println("Fehler beim Senden der Daten!");
         }
+    } catch (const std::exception& e) {
+        Serial.print("Fehler bei der Datenverarbeitung: ");
+        Serial.println(e.what());
     }
-    delay(100);
 }
