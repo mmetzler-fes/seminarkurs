@@ -133,25 +133,20 @@ class ExampleGame:
         try:
             devices = await BleakScanner.discover(timeout=10.0)  # Timeout von 10 Sekunden
             for device in devices:
-                advertisement_data = device.metadata  # Hole die Werbedaten (Achtung: metadata ist bald veraltet)
-
-                # Korrekte Abfrage der Service UUIDs mit advertisement_data.service_uuids
-                if advertisement_data and "uuids" in advertisement_data:
-                    service_uuids = advertisement_data["uuids"]
-                else:
-                    service_uuids = []
-
-                if SERVICE_UUID.lower() in service_uuids:
-                    self.ble_device_address = device.address
-                    print(f"✅ Gefundenes ESP32-Gerät: {self.ble_device_address}")
-                    self.root.after(0, self.enable_connect_button, device.name)
-                    return
+                # Nutze advertisement_data direkt vom Device-Objekt
+                if device.advertisement.service_uuids:
+                    service_uuids = [str(uuid).lower() for uuid in device.advertisement.service_uuids]
+                    
+                    if SERVICE_UUID.lower() in service_uuids:
+                        self.ble_device_address = device.address
+                        print(f"✅ Gefundenes ESP32-Gerät: {self.ble_device_address}")
+                        self.root.after(0, self.enable_connect_button, device.name)
+                        return
 
             self.root.after(0, self.show_no_device_found)
         except Exception as e:
             print(f"⚠️ Fehler beim Scannen: {e}")
             self.root.after(0, self.show_no_device_found)
-
 
 
     def enable_connect_button(self, device_name):
